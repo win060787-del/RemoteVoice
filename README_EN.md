@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="Resources/Brand/remotevoice-logo.png" width="160" alt="RemoteVoice silver voice remote logo">
+
 # Xiaomi Remote · Vibe Coding · Codex for macOS
 
 **A native Mac companion for Bluetooth remote dictation and control.**

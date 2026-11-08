@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="Resources/Brand/remotevoice-logo.png" width="160" alt="RemoteVoice silver voice remote logo">
+
 # 小米遥控器 Vibe Coding Codex for macOS
 
 **让兼容蓝牙遥控器成为 Mac 的语音输入与控制工具。**

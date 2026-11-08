@@ -65,7 +65,7 @@ enum MiAoRuntimeStatus: Equatable {
 
 enum MiAoMenuBarIconFactory {
     static let opticalSize = NSSize(width: 17, height: 17)
-    static let brandAssetName = "mi-ao-menubar-sun-template.svg"
+    static let brandAssetName = "remotevoice-menubar-template.svg"
 
     static func image(for icon: MiAoMenuBarIcon, label: String) -> NSImage? {
         let image: NSImage?
@@ -73,7 +73,7 @@ enum MiAoMenuBarIconFactory {
         case .brand:
             image =
                 brandImage()
-                ?? configuredSystemSymbol(named: "sun.max", label: label)
+                ?? configuredSystemSymbol(named: "mic", label: label)
         case .systemSymbol(let name):
             image = configuredSystemSymbol(named: name, label: label)
         }

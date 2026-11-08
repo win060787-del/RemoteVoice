@@ -40,11 +40,8 @@ fi
 [[ -x "$BUILT_RUNTIME/scripts/configure-qwen.sh" ]]
 [[ -f "$BUILT_PROFILE" ]]
 [[ -s "$BUILT_ICON" ]]
-[[ -s "$BUILT_BRAND/mi-ao-symbol-gradient.svg" ]]
-[[ -s "$BUILT_BRAND/mi-ao-symbol-gradient-1024.png" ]]
-[[ -s "$BUILT_BRAND/mi-ao-symbol-template.svg" ]]
-[[ -s "$BUILT_BRAND/mi-ao-symbol-template-1024.png" ]]
-[[ -s "$BUILT_BRAND/mi-ao-menubar-sun-template.svg" ]]
+[[ -s "$BUILT_BRAND/remotevoice-logo.png" ]]
+[[ -s "$BUILT_BRAND/remotevoice-menubar-template.svg" ]]
 [[ -s "$BUILT_BRAND/LUCIDE_LICENSE.txt" ]]
 [[ -x "$BUILT_RUNTIME/scripts/start.sh" ]]
 [[ -x "$BUILT_RUNTIME/scripts/stop.sh" ]]
@@ -65,16 +62,8 @@ ditto "$BUILD_APP" "$RELOCATED_APP"
 codesign --verify --deep --strict "$RELOCATED_APP"
 
 cmp "$ROOT/Resources/HardwareProfiles/xiaomi-remote-2-pro-2671.plist" "$BUILT_PROFILE"
-cmp "$ROOT/Resources/Brand/mi-ao-symbol-gradient.svg" "$BUILT_BRAND/mi-ao-symbol-gradient.svg"
-cmp "$ROOT/Resources/Brand/mi-ao-symbol-gradient-1024.png" "$BUILT_BRAND/mi-ao-symbol-gradient-1024.png"
-cmp "$ROOT/Resources/Brand/mi-ao-symbol-template.svg" "$BUILT_BRAND/mi-ao-symbol-template.svg"
-cmp \
-  "$ROOT/Resources/Brand/mi-ao-menubar-sun-template.svg" \
-  "$BUILT_BRAND/mi-ao-menubar-sun-template.svg"
-cmp "$ROOT/Resources/Brand/LUCIDE_LICENSE.txt" "$BUILT_BRAND/LUCIDE_LICENSE.txt"
-cmp \
-  "$ROOT/Resources/Brand/mi-ao-symbol-template-1024.png" \
-  "$BUILT_BRAND/mi-ao-symbol-template-1024.png"
+cmp "$ROOT/Resources/Brand/remotevoice-logo.png" "$BUILT_BRAND/remotevoice-logo.png"
+cmp "$ROOT/Resources/Brand/remotevoice-menubar-template.svg" "$BUILT_BRAND/remotevoice-menubar-template.svg"
 cmp \
   "$ROOT/Resources/HardwareProfiles/xiaomi-remote-2-pro-2671.plist" \
   "$BUILT_RUNTIME/Resources/HardwareProfiles/xiaomi-remote-2-pro-2671.plist"
