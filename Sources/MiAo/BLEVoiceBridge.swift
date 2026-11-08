@@ -1,0 +1,1259 @@
+// Copyright (c) 2026 FanXeon@Poemcoder with Codex
+import AppKit
+import ApplicationServices
+@preconcurrency import CoreBluetooth
+import Foundation
+
+final class BLEVoiceBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate, @unchecked Sendable {
+    private enum SessionState: String {
+        case disconnected, discovering, negotiating, ready, opening, streaming
+    }
+
+    private let configuration: Configuration
+    private var inputEnabled = false
+    private let statusHandler: ((MiAoRuntimeStatus) -> Void)?
+    private let protocolHandler = ATVVProtocol()
+    private var central: CBCentralManager!
+    private var peripheral: CBPeripheral?
+    private var txCharacteristic: CBCharacteristic?
+    private var rxCharacteristic: CBCharacteristic?
+    private var controlCharacteristic: CBCharacteristic?
+    private var notificationReady = Set<String>()
+    private var didSendCapabilitiesRequest = false
+    private var state: SessionState = .disconnected
+    private var streamID: UInt8 = 0
+    private var samples: [Int16] = []
+    private var lastSequence: UInt16?
+    private var detectedSpeech = false
+    private var lastSpeechAt = Date()
+    private var silenceTimer: Timer?
+    private var keepAliveTimer: Timer?
+    private var scanStopTimer: Timer?
+    private var captureStopTimer: Timer?
+    private var selectionTimer: Timer?
+    private var reconnectTimer: Timer?
+    private var capabilityNegotiationTimer: Timer?
+    private var capabilityRequestCount = 0
+    private let capabilityNegotiationPolicy = CapabilityNegotiationPolicy()
+    private var disconnectReasonOverride: String?
+    private var discoveredIdentifiers = Set<UUID>()
+    private var candidatePeripherals: [UUID: CBPeripheral] = [:]
+    private var candidateRecords: [UUID: BLEDeviceCandidate] = [:]
+    private var voiceReconnectPolicy: VoiceReconnectPolicy
+    private var voiceReconnectSleeping = false
+    private var speechJobs: SpeechJobQueue?
+    private var speechModelReady = false
+    private let liveInput = LiveDictationInput()
+    private var dictationSessionID = UUID()
+    private var lastStreamingSampleCount = 0
+    private var usesStreamingInput: Bool {
+        configuration.speechEngine == "qwen" && inputEnabled && HomeRuntimeOptions.load().streaming
+    }
+    private var captureRecorder: CaptureRecorder?
+    private var shutdownRequested = false
+    private(set) var isFinished = false
+    private(set) var exitStatus: Int32 = 0
+
+    init(
+        configuration: Configuration,
+        statusHandler: ((MiAoRuntimeStatus) -> Void)? = nil
+    ) {
+        self.configuration = configuration
+        self.inputEnabled = configuration.submitToCodex
+        self.statusHandler = statusHandler
+        voiceReconnectPolicy = VoiceReconnectPolicy(mode: configuration.voiceConnectionMode)
+        super.init()
+        if configuration.mode == .run {
+            DistributedNotificationCenter.default().addObserver(
+                self,
+                selector: #selector(voiceConnectionModeChanged),
+                name: MiAoRuntimeNotifications.voiceConnectionModeChanged,
+                object: nil
+            )
+        }
+    }
+
+    deinit {
+        DistributedNotificationCenter.default().removeObserver(self)
+    }
+
+    func start() throws {
+        if configuration.mode == .doctor {
+            try runDoctor()
+            return
+        }
+        if configuration.mode == .authorize {
+            requestAccessibilityAuthorization()
+            return
+        }
+
+        if configuration.mode == .run {
+            publish(.starting)
+            let transcribe: SpeechJobQueue.Transcribe
+            if configuration.speechEngine == "qwen" {
+                let transcriber = try QwenTranscriber()
+                transcribe = { try transcriber.transcribe(wavURL: $0) }
+                log("本地语音引擎：Qwen3-ASR-1.7B · MLX · 中文")
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    do {
+                        try transcriber.warmUp()
+                        self?.log("Qwen模型预热完成，可开始语音输入")
+                        DispatchQueue.main.async {
+                            self?.speechModelReady = true
+                            if self?.state == .ready { self?.publishReadyStatus() }
+                        }
+                    } catch {
+                        self?.log("Qwen模型预热失败：\(error.localizedDescription)")
+                    }
+                }
+            } else {
+                let transcriber = try WhisperTranscriber(configuration: configuration)
+                speechModelReady = true
+                transcribe = { try transcriber.transcribe(wavURL: $0) }
+            }
+            speechJobs = SpeechJobQueue(
+                transcribe: transcribe,
+                submit: { text, force, completion in
+                    CodexSubmitter().submit(text, force: force) { completion(HomeRuntimeOptions.finish($0)) }
+                },
+                streamingSubmit: { [liveInput] id, text, isFinal, completion in
+                    liveInput.update(id: id, text: text, isFinal: isFinal) {
+                        completion(HomeRuntimeOptions.finish($0, final: isFinal))
+                    }
+                }
+            )
+            let outputDirectoryExisted = FileManager.default.fileExists(
+                atPath: configuration.outputDirectory
+            )
+            try FileManager.default.createDirectory(
+                atPath: configuration.outputDirectory,
+                withIntermediateDirectories: true
+            )
+            let defaultOutputDirectory = Configuration().outputDirectory
+            if !outputDirectoryExisted || configuration.outputDirectory == defaultOutputDirectory {
+                try FileManager.default.setAttributes(
+                    [.posixPermissions: 0o700],
+                    ofItemAtPath: configuration.outputDirectory
+                )
+            }
+        }
+        if configuration.mode == .capture {
+            captureRecorder = try CaptureRecorder(
+                directory: configuration.captureDirectory,
+                includeIdentifiers: configuration.includeIdentifiers,
+                includeDeviceNames: configuration.includeDeviceNames
+            )
+            if let captureRecorder {
+                log("采集目录：\(captureRecorder.sessionDirectory.path)")
+                log("设备 UUID 与名称默认脱敏；原始 GATT payload 仅保存在本机，分享前必须复核")
+            }
+        }
+
+        central = CBCentralManager(delegate: self, queue: .main)
+    }
+
+    func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        switch central.state {
+        case .poweredOn:
+            voiceReconnectPolicy.reset()
+            voiceReconnectSleeping = false
+            log("蓝牙已就绪")
+            if configuration.mode == .run {
+                log("语音连接模式：\(voiceReconnectPolicy.mode.displayName)")
+            }
+            publish(.searching)
+            if configuration.mode == .run, connectKnownRunPeripheralIfAvailable(reason: "启动") {
+                return
+            }
+
+            if configuration.mode == .capture,
+                let identifier = configuration.peripheralIdentifier,
+                let known = central.retrievePeripherals(withIdentifiers: [identifier]).first
+            {
+                connect(known, reason: "指定 identifier")
+                return
+            }
+
+            if configuration.mode == .capture, discoverConnectedPeripheralsForCapture() {
+                return
+            }
+
+            startScan()
+        case .unauthorized:
+            fatal("没有蓝牙权限。请在 系统设置 → 隐私与安全性 → 蓝牙 中允许本程序。")
+        case .unsupported:
+            fatal("这台 Mac 不支持 CoreBluetooth")
+        case .poweredOff:
+            if configuration.mode == .run {
+                clearConnectionState()
+                scanStopTimer?.invalidate()
+                selectionTimer?.invalidate()
+                reconnectTimer?.invalidate()
+                publish(.error("蓝牙已关闭 · 开启后会自动继续"))
+                log("蓝牙已关闭；等待系统蓝牙恢复")
+            } else {
+                fatal("蓝牙已关闭")
+            }
+        default:
+            log("等待蓝牙状态：\(central.state.rawValue)")
+        }
+    }
+
+    private func startScan() {
+        reconnectTimer?.invalidate()
+        reconnectTimer = nil
+        selectionTimer?.invalidate()
+        selectionTimer = nil
+        if configuration.mode == .run, connectKnownRunPeripheralIfAvailable(reason: "重连") {
+            return
+        }
+
+        state = .discovering
+        if configuration.mode == .run { publish(.searching) }
+        candidatePeripherals.removeAll()
+        candidateRecords.removeAll()
+        central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+        let scanMessage =
+            configuration.mode == .run
+            ? "正在寻找带 ATVV 服务的兼容遥控器…"
+            : "正在扫描附近 BLE 设备…"
+        log(scanMessage)
+        captureRecorder?.recordEvent(type: "scan_started", detail: "seconds=\(configuration.scanSeconds)")
+        scanStopTimer?.invalidate()
+        scanStopTimer = Timer.scheduledTimer(withTimeInterval: configuration.scanSeconds, repeats: false) {
+            [weak self] _ in
+            guard let self else { return }
+            switch self.configuration.mode {
+            case .scan:
+                self.log("扫描结束，共发现 \(self.discoveredIdentifiers.count) 个 BLE 设备")
+                self.isFinished = true
+                CFRunLoopStop(CFRunLoopGetMain())
+            case .capture:
+                let reason = self.peripheral == nil ? "scan-timeout" : "capture-timeout"
+                self.finishCapture(reason: reason)
+            case .run:
+                if self.peripheral == nil {
+                    self.scheduleReconnect(reason: "未发现已选遥控器")
+                }
+            case .launch, .setup, .doctor, .authorize, .checkButtons, .learnButtons,
+                .debugButtons:
+                break
+            }
+        }
+    }
+
+    @discardableResult
+    private func connectKnownRunPeripheralIfAvailable(reason: String) -> Bool {
+        guard configuration.mode == .run else { return false }
+
+        if let identifier = configuration.peripheralIdentifier,
+            let known = central.retrievePeripherals(withIdentifiers: [identifier]).first
+        {
+            connect(known, reason: "\(reason)：已选设备 UUID")
+            return true
+        }
+
+        let connected = central.retrieveConnectedPeripherals(
+            withServices: [CBUUID(string: ATVVProtocol.serviceUUID)]
+        )
+        let candidates = connected.map {
+            BLEDeviceCandidate(
+                identifier: $0.identifier,
+                name: $0.name,
+                rssi: -127,
+                advertisesATVV: true
+            )
+        }
+        guard let selected = deviceSelectionPolicy.bestCandidate(from: candidates),
+            let match = connected.first(where: { $0.identifier == selected.identifier })
+        else { return false }
+
+        connect(match, reason: "\(reason)：系统已连接 ATVV 设备")
+        return true
+    }
+
+    @discardableResult
+    private func discoverConnectedPeripheralsForCapture() -> Bool {
+        let queryServices = [
+            "1800",  // Generic Access
+            "1801",  // Generic Attribute
+            "180A",  // Device Information
+            "180F",  // Battery
+            "1812",  // Human Interface Device
+            ATVVProtocol.serviceUUID,
+        ]
+        var matches: [UUID: (peripheral: CBPeripheral, services: Set<String>)] = [:]
+
+        for serviceUUID in queryServices {
+            let service = CBUUID(string: serviceUUID)
+            for peripheral in central.retrieveConnectedPeripherals(withServices: [service]) {
+                var match = matches[peripheral.identifier] ?? (peripheral, [])
+                match.services.insert(serviceUUID.uppercased())
+                matches[peripheral.identifier] = match
+            }
+        }
+
+        for match in matches.values.sorted(by: {
+            ($0.peripheral.name ?? $0.peripheral.identifier.uuidString)
+                < ($1.peripheral.name ?? $1.peripheral.identifier.uuidString)
+        }) {
+            let peripheral = match.peripheral
+            let name = peripheral.name ?? "(unknown)"
+            let services = match.services.sorted()
+            discoveredIdentifiers.insert(peripheral.identifier)
+            captureRecorder?.recordDiscovery(
+                identifier: peripheral.identifier,
+                name: name,
+                rssi: 127,
+                advertisedServices: []
+            )
+            captureRecorder?.recordEvent(
+                type: "connected_peripheral_retrieved",
+                detail: "services=\(services.joined(separator: ","))",
+                deviceIdentifier: peripheral.identifier
+            )
+            print(
+                "已连接 name=\(name) id=\(peripheral.identifier.uuidString) via_services=[\(services.joined(separator: ","))]"
+            )
+
+            if configuration.nameFilter != nil, isCandidate(peripheral, discoveredName: name) {
+                connect(peripheral, reason: "已连接 BLE 设备名称匹配")
+                return true
+            }
+        }
+        return false
+    }
+
+    func centralManager(
+        _ central: CBCentralManager,
+        didDiscover peripheral: CBPeripheral,
+        advertisementData: [String: Any],
+        rssi RSSI: NSNumber
+    ) {
+        let advertisedServices = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
+        let name = peripheral.name ?? (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? "(unknown)"
+        let hasATVV = advertisedServices.contains(CBUUID(string: ATVVProtocol.serviceUUID))
+        captureRecorder?.recordDiscovery(
+            identifier: peripheral.identifier,
+            name: name,
+            rssi: RSSI.intValue,
+            advertisedServices: advertisedServices.map(\.uuidString)
+        )
+
+        if discoveredIdentifiers.insert(peripheral.identifier).inserted || configuration.debug {
+            let serviceList = advertisedServices.map(\.uuidString).joined(separator: ",")
+            print(
+                "发现 name=\(name) id=\(peripheral.identifier.uuidString) rssi=\(RSSI) atvv=\(hasATVV) services=[\(serviceList)]"
+            )
+        }
+
+        guard self.peripheral == nil else { return }
+        if configuration.mode == .run {
+            considerForConnection(
+                peripheral,
+                candidate: BLEDeviceCandidate(
+                    identifier: peripheral.identifier,
+                    name: name == "(unknown)" ? nil : name,
+                    rssi: RSSI.intValue,
+                    advertisesATVV: hasATVV
+                )
+            )
+        } else if configuration.mode == .capture,
+            (configuration.peripheralIdentifier != nil || configuration.nameFilter != nil),
+            isCandidate(peripheral, discoveredName: name)
+        {
+            connect(peripheral, reason: "采集目标匹配")
+        }
+    }
+
+    private func isCandidate(_ peripheral: CBPeripheral, discoveredName: String? = nil) -> Bool {
+        if let identifier = configuration.peripheralIdentifier {
+            return peripheral.identifier == identifier
+        }
+        guard let filter = configuration.nameFilter?.lowercased() else { return false }
+        return (discoveredName ?? peripheral.name)?.lowercased().contains(filter) == true
+    }
+
+    private var deviceSelectionPolicy: BLEDeviceSelectionPolicy {
+        BLEDeviceSelectionPolicy(
+            preferredIdentifier: configuration.peripheralIdentifier,
+            nameFilter: configuration.nameFilter
+        )
+    }
+
+    private func considerForConnection(
+        _ peripheral: CBPeripheral,
+        candidate: BLEDeviceCandidate
+    ) {
+        let policy = deviceSelectionPolicy
+        guard policy.accepts(candidate) else { return }
+        candidatePeripherals[candidate.identifier] = peripheral
+        candidateRecords[candidate.identifier] = candidate
+
+        if configuration.peripheralIdentifier == candidate.identifier {
+            connect(peripheral, reason: "已选设备 UUID 匹配")
+            return
+        }
+        guard selectionTimer == nil else { return }
+        selectionTimer = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: false) {
+            [weak self] _ in
+            guard let self, self.peripheral == nil else { return }
+            self.selectionTimer = nil
+            guard
+                let selected = self.deviceSelectionPolicy.bestCandidate(
+                    from: Array(self.candidateRecords.values)
+                ),
+                let peripheral = self.candidatePeripherals[selected.identifier]
+            else { return }
+            let reason =
+                selected.matches(nameFilter: self.configuration.nameFilter)
+                ? "多设备仲裁：名称与信号最佳"
+                : "多设备仲裁：ATVV 信号最佳"
+            self.connect(peripheral, reason: reason)
+        }
+    }
+
+    private func connect(_ peripheral: CBPeripheral, reason: String) {
+        central.stopScan()
+        scanStopTimer?.invalidate()
+        selectionTimer?.invalidate()
+        selectionTimer = nil
+        reconnectTimer?.invalidate()
+        reconnectTimer = nil
+        self.peripheral = peripheral
+        peripheral.delegate = self
+        captureRecorder?.setTarget(
+            identifier: peripheral.identifier,
+            name: peripheral.name ?? "(unknown)"
+        )
+        captureRecorder?.recordEvent(
+            type: "connect_requested",
+            detail: reason,
+            deviceIdentifier: peripheral.identifier
+        )
+        log("连接 \(peripheral.name ?? peripheral.identifier.uuidString)（\(reason)）")
+        if configuration.mode == .run { publish(.connecting) }
+        central.connect(peripheral)
+    }
+
+    func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        log("已连接，枚举全部 GATT services")
+        RemoteDeviceStatus.update(connected: true)
+        captureRecorder?.recordConnection(identifier: peripheral.identifier, connected: true)
+        if configuration.mode == .capture {
+            captureStopTimer?.invalidate()
+            captureStopTimer = Timer.scheduledTimer(
+                withTimeInterval: configuration.captureSeconds,
+                repeats: false
+            ) { [weak self] _ in
+                self?.finishCapture(reason: "capture-timeout")
+            }
+        }
+        peripheral.discoverServices(nil)
+    }
+
+    func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        captureRecorder?.recordConnection(
+            identifier: peripheral.identifier,
+            connected: false,
+            detail: error?.localizedDescription ?? "unknown"
+        )
+        let detail = error?.localizedDescription ?? "unknown"
+        disconnectReasonOverride = nil
+        clearConnectionState()
+        if configuration.mode == .run {
+            scheduleReconnect(reason: "连接失败：\(detail)")
+        } else {
+            fatal("连接失败：\(detail)")
+        }
+    }
+
+    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        log("遥控器断开：\(error?.localizedDescription ?? "normal")")
+        let reconnectReason =
+            disconnectReasonOverride ?? error?.localizedDescription ?? "遥控器已断开"
+        disconnectReasonOverride = nil
+        captureRecorder?.recordConnection(
+            identifier: peripheral.identifier,
+            connected: false,
+            detail: error?.localizedDescription ?? "normal"
+        )
+        if configuration.mode == .capture, state == .streaming || state == .opening {
+            finalizeRecording(reason: "device-disconnected")
+        }
+        clearConnectionState()
+        if configuration.mode == .run { publish(.disconnected) }
+        if shutdownRequested {
+            finishShutdownIfPossible()
+            return
+        }
+        if configuration.mode == .capture {
+            finishCapture(reason: "device-disconnected")
+            return
+        }
+        scheduleReconnect(reason: reconnectReason)
+    }
+
+    private func clearConnectionState() {
+        RemoteDeviceStatus.update(connected: false)
+        state = .disconnected
+        peripheral = nil
+        txCharacteristic = nil
+        rxCharacteristic = nil
+        controlCharacteristic = nil
+        notificationReady.removeAll()
+        didSendCapabilitiesRequest = false
+        capabilityRequestCount = 0
+        stopCapabilityNegotiation()
+        stopTimers()
+    }
+
+    private func scheduleReconnect(reason: String) {
+        guard configuration.mode == .run, !shutdownRequested else { return }
+        central.stopScan()
+        scanStopTimer?.invalidate()
+        scanStopTimer = nil
+        selectionTimer?.invalidate()
+        selectionTimer = nil
+        reconnectTimer?.invalidate()
+        reconnectTimer = nil
+
+        switch voiceReconnectPolicy.nextDecision() {
+        case .retry(let attempt, let delay):
+            voiceReconnectSleeping = false
+            log("连接暂不可用：\(reason)；\(String(format: "%.0f", delay)) 秒后自动重试")
+            publish(.reconnecting(attempt: attempt, delaySeconds: Int(ceil(delay))))
+            reconnectTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) {
+                [weak self] _ in
+                guard let self, !self.shutdownRequested else { return }
+                self.reconnectTimer = nil
+                self.startScan()
+            }
+        case .sleep:
+            voiceReconnectSleeping = true
+            log("连接暂不可用：\(reason)；已进入智能休眠，等待遥控器按键、蓝牙恢复或手动唤醒")
+            publish(.voiceSleeping)
+        }
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        if let error { return fatal("枚举 service 失败：\(error.localizedDescription)") }
+        guard let services = peripheral.services else { return fatal("设备没有暴露 GATT services") }
+        for service in services {
+            log("service \(service.uuid.uuidString)")
+            captureRecorder?.recordService(service.uuid.uuidString, isPrimary: service.isPrimary)
+            peripheral.discoverCharacteristics(nil, for: service)
+        }
+        guard services.contains(where: { $0.uuid == CBUUID(string: ATVVProtocol.serviceUUID) }) else {
+            if configuration.mode == .capture {
+                log("目标未暴露标准 ATVV 服务；继续采集全部 GATT，等待按键与通知事件")
+                captureRecorder?.recordEvent(
+                    type: "protocol_observation",
+                    detail: "standard ATVV service not found"
+                )
+                return
+            }
+            fatal("该设备未暴露 Google ATVV 服务 \(ATVVProtocol.serviceUUID)。已输出所有 service 供继续逆向。")
+            return
+        }
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+        if let error {
+            if configuration.mode == .capture {
+                log("枚举 characteristic 失败 \(service.uuid)：\(error.localizedDescription)")
+                captureRecorder?.recordEvent(
+                    type: "error",
+                    detail: "characteristic discovery \(service.uuid): \(error.localizedDescription)"
+                )
+                return
+            }
+            return fatal("枚举 characteristic 失败：\(error.localizedDescription)")
+        }
+        for characteristic in service.characteristics ?? [] {
+            let propertyNames = characteristicPropertyNames(characteristic.properties)
+            log(
+                "characteristic \(characteristic.uuid.uuidString) properties=\(propertyNames.joined(separator: ",")) raw=\(characteristic.properties.rawValue)"
+            )
+            captureRecorder?.recordCharacteristic(
+                serviceUUID: service.uuid.uuidString,
+                uuid: characteristic.uuid.uuidString,
+                properties: propertyNames,
+                rawProperties: characteristic.properties.rawValue
+            )
+            if configuration.mode == .capture {
+                peripheral.discoverDescriptors(for: characteristic)
+            }
+            if characteristic.uuid == CBUUID(string: "2A19") {
+                if characteristic.properties.contains(.read) { peripheral.readValue(for: characteristic) }
+                if characteristic.properties.contains(.notify) { peripheral.setNotifyValue(true, for: characteristic) }
+                continue
+            }
+            switch characteristic.uuid.uuidString.uppercased() {
+            case ATVVProtocol.txUUID:
+                txCharacteristic = characteristic
+            case ATVVProtocol.rxUUID:
+                rxCharacteristic = characteristic
+            case ATVVProtocol.controlUUID:
+                controlCharacteristic = characteristic
+            default:
+                break
+            }
+
+            if configuration.mode == .capture {
+                if characteristic.properties.contains(.notify) || characteristic.properties.contains(.indicate) {
+                    peripheral.setNotifyValue(true, for: characteristic)
+                }
+                if characteristic.properties.contains(.read) {
+                    peripheral.readValue(for: characteristic)
+                }
+            } else if characteristic.uuid.uuidString.uppercased() == ATVVProtocol.rxUUID
+                || characteristic.uuid.uuidString.uppercased() == ATVVProtocol.controlUUID
+            {
+                peripheral.setNotifyValue(true, for: characteristic)
+            }
+        }
+        negotiateIfReady()
+    }
+
+    func peripheral(
+        _ peripheral: CBPeripheral, didDiscoverDescriptorsFor characteristic: CBCharacteristic, error: Error?
+    ) {
+        if let error {
+            if configuration.mode == .capture {
+                log("枚举 descriptor 失败 \(characteristic.uuid)：\(error.localizedDescription)")
+                captureRecorder?.recordEvent(
+                    type: "error",
+                    detail: "descriptor discovery \(characteristic.uuid): \(error.localizedDescription)"
+                )
+                return
+            }
+            return
+        }
+        guard configuration.mode == .capture else { return }
+        guard let service = characteristic.service else {
+            captureRecorder?.recordEvent(
+                type: "error",
+                detail: "descriptor discovery missing parent service for \(characteristic.uuid)"
+            )
+            return
+        }
+        for descriptor in characteristic.descriptors ?? [] {
+            log("descriptor \(descriptor.uuid.uuidString) for \(characteristic.uuid.uuidString)")
+            captureRecorder?.recordDescriptor(
+                serviceUUID: service.uuid.uuidString,
+                characteristicUUID: characteristic.uuid.uuidString,
+                uuid: descriptor.uuid.uuidString
+            )
+        }
+    }
+
+    func peripheral(
+        _ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?
+    ) {
+        if characteristic.uuid == CBUUID(string: "2A19") { return }
+        if let error {
+            if configuration.mode == .capture {
+                log("订阅通知失败 \(characteristic.uuid)：\(error.localizedDescription)")
+                captureRecorder?.recordEvent(
+                    type: "notification_state",
+                    detail: "error: \(error.localizedDescription)",
+                    characteristicUUID: characteristic.uuid.uuidString
+                )
+                return
+            }
+            return fatal("订阅通知失败 \(characteristic.uuid)：\(error.localizedDescription)")
+        }
+        if characteristic.isNotifying {
+            notificationReady.insert(characteristic.uuid.uuidString.uppercased())
+            log("已订阅 \(characteristic.uuid.uuidString)")
+        }
+        captureRecorder?.recordEvent(
+            type: "notification_state",
+            detail: characteristic.isNotifying ? "subscribed" : "not-subscribed",
+            characteristicUUID: characteristic.uuid.uuidString
+        )
+        negotiateIfReady()
+    }
+
+    private func negotiateIfReady() {
+        guard !didSendCapabilitiesRequest,
+            txCharacteristic != nil,
+            notificationReady.contains(ATVVProtocol.rxUUID),
+            notificationReady.contains(ATVVProtocol.controlUUID)
+        else { return }
+        didSendCapabilitiesRequest = true
+        state = .negotiating
+        sendCapabilitiesRequest()
+    }
+
+    private func sendCapabilitiesRequest() {
+        capabilityNegotiationTimer?.invalidate()
+        capabilityRequestCount += 1
+        write(protocolHandler.getCapabilitiesCommand)
+        log(
+            "TX GET_CAPS \(hex(protocolHandler.getCapabilitiesCommand)) "
+                + "(\(capabilityRequestCount)/\(capabilityNegotiationPolicy.maximumRequests))"
+        )
+        capabilityNegotiationTimer = Timer.scheduledTimer(
+            withTimeInterval: capabilityNegotiationPolicy.retryDelay,
+            repeats: false
+        ) { [weak self] _ in
+            self?.handleCapabilityNegotiationTimeout()
+        }
+    }
+
+    private func handleCapabilityNegotiationTimeout() {
+        capabilityNegotiationTimer = nil
+        guard configuration.mode == .run,
+            !shutdownRequested,
+            state == .negotiating,
+            let peripheral
+        else { return }
+
+        switch capabilityNegotiationPolicy.decision(afterRequestCount: capabilityRequestCount) {
+        case .retry:
+            log("遥控器尚未响应 ATVV 能力协商，正在重试")
+            publish(.connecting)
+            sendCapabilitiesRequest()
+        case .reconnect:
+            let reason = "ATVV 能力协商超时（已尝试 \(capabilityRequestCount) 次）"
+            log("\(reason)，断开后重新连接")
+            publish(.error("遥控器未响应能力协商，正在重新连接"))
+            disconnectReasonOverride = reason
+            central.cancelPeripheralConnection(peripheral)
+        }
+    }
+
+    private func stopCapabilityNegotiation() {
+        capabilityNegotiationTimer?.invalidate()
+        capabilityNegotiationTimer = nil
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        if characteristic.uuid == CBUUID(string: "2A19") {
+            if error == nil, let level = characteristic.value?.first { RemoteDeviceStatus.updateBattery(level) }
+            return
+        }
+
+        if let error {
+            if configuration.mode == .capture {
+                log("读取特征值失败 \(characteristic.uuid)：\(error.localizedDescription)")
+                captureRecorder?.recordEvent(
+                    type: "value_error",
+                    detail: error.localizedDescription,
+                    characteristicUUID: characteristic.uuid.uuidString
+                )
+                return
+            }
+            return fatal("读取通知失败 \(characteristic.uuid)：\(error.localizedDescription)")
+        }
+        guard let data = characteristic.value else { return }
+        captureRecorder?.recordValue(
+            characteristicUUID: characteristic.uuid.uuidString,
+            data: data,
+            detail: characteristic.isNotifying ? "notification" : "read"
+        )
+        if configuration.debug { log("RX \(characteristic.uuid.uuidString) \(hex(data))") }
+
+        switch characteristic.uuid.uuidString.uppercased() {
+        case ATVVProtocol.controlUUID:
+            handleControl(protocolHandler.parseControl(data))
+        case ATVVProtocol.rxUUID:
+            handleAudio(data)
+        default:
+            break
+        }
+    }
+
+    private func handleControl(_ event: ATVVControlEvent) {
+        switch event {
+        case .capabilities(let capabilities):
+            do {
+                stopCapabilityNegotiation()
+                try protocolHandler.acceptCapabilities(capabilities)
+                state = .ready
+                voiceReconnectPolicy.reset()
+                voiceReconnectSleeping = false
+                log(
+                    "ATVV v\(capabilities.version)，codec=\(protocolHandler.codec!)，interaction=0x\(String(format: "%02x", capabilities.interactionModel))，frame=\(capabilities.frameSize)B"
+                )
+                log("桥接已就绪：按遥控器语音键开始说话")
+                publishReadyStatus()
+            } catch { fatal(error.localizedDescription) }
+        case .startSearch:
+            guard !shutdownRequested else { return }
+            if state == .streaming || state == .opening {
+                log("第二次 START_SEARCH，结束本次语音")
+                closeAndFinalize(reason: "second-press")
+            } else if state == .ready {
+                beginOpening()
+            } else {
+                log("能力协商尚未完成，忽略本次语音请求")
+            }
+        case .audioStart(_, let codec, let newStreamID):
+            // Audio notifications can arrive before AUDIO_START on the control
+            // characteristic. beginOpening already cleared the previous clip.
+            // Keep those early frames instead of dropping the first syllables.
+            let recordingAlreadyStarted = state == .opening || state == .streaming
+            streamID = newStreamID
+            state = .streaming
+            if !recordingAlreadyStarted {
+                dictationSessionID = UUID()
+                lastStreamingSampleCount = 0
+                samples.removeAll(keepingCapacity: true)
+                lastSequence = nil
+                detectedSpeech = false
+                lastSpeechAt = Date()
+            }
+            log("AUDIO_START \(codec)，开始录音")
+            publish(.recording)
+            startTimers()
+        case .audioStop(let reason):
+            log("AUDIO_STOP reason=0x\(String(format: "%02x", reason))")
+            finalizeRecording(reason: "remote-release")
+        case .audioSync(let codec, let sequence, let predictor, let stepIndex):
+            protocolHandler.applyAudioSync(codec: codec, sequence: sequence, predictor: predictor, stepIndex: stepIndex)
+        case .micOpenError(let code):
+            state = .ready
+            fatal("遥控器拒绝 MIC_OPEN，错误码 0x\(String(format: "%04x", code))")
+        case .unknown(let data):
+            if configuration.debug { log("未知 CTL \(hex(data))") }
+        }
+    }
+
+    private func beginOpening() {
+        do {
+            let command = try protocolHandler.micOpenCommand()
+            write(command)
+            state = .opening
+            dictationSessionID = UUID()
+            lastStreamingSampleCount = 0
+            samples.removeAll(keepingCapacity: true)
+            lastSequence = nil
+            detectedSpeech = false
+            lastSpeechAt = Date()
+            log("TX MIC_OPEN \(hex(command))")
+            publish(.recording)
+        } catch { fatal(error.localizedDescription) }
+    }
+
+    private func handleAudio(_ data: Data) {
+        let wasOpening = state == .opening
+        guard state == .streaming || wasOpening,
+            let frame = protocolHandler.decodeAudio(data)
+        else { return }
+        state = .streaming
+        // ATVV v0.4 can start sending frames directly after MIC_OPEN without AUDIO_START.
+        if wasOpening { startTimers() }
+        if let lastSequence {
+            let expected = lastSequence &+ 1
+            if frame.sequence != expected {
+                log("警告：音频丢帧 expected=\(expected) actual=\(frame.sequence)")
+            }
+        }
+        lastSequence = frame.sequence
+        samples.append(contentsOf: frame.samples)
+        enqueueStreamingSnapshotIfReady()
+
+        let rms = AudioPipeline.rootMeanSquare(frame.samples)
+        if rms >= configuration.silenceThreshold {
+            detectedSpeech = true
+            lastSpeechAt = Date()
+        }
+    }
+
+    private func enqueueStreamingSnapshotIfReady() {
+        guard usesStreamingInput, configuration.mode == .run, let speechJobs,
+            speechJobs.pendingCount == 0, !liveInput.isPaused(id: dictationSessionID)
+        else { return }
+        let rate = protocolHandler.codec?.sampleRate ?? 16_000
+        let intervalSamples = Int(Double(rate) * 0.6)
+        guard samples.count >= intervalSamples,
+            samples.count - lastStreamingSampleCount >= intervalSamples
+        else { return }
+        lastStreamingSampleCount = samples.count
+        let request = SpeechJobRequest(
+            samples: samples, sampleRate: rate, gainDB: configuration.gainDB,
+            outputDirectory: configuration.outputDirectory, reason: "streaming",
+            submitToCodex: true, forceSubmit: false,
+            streamingSessionID: dictationSessionID, isFinal: false
+        )
+        _ = speechJobs.enqueue(request) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let output):
+                if output.submitted {
+                    self.log("流式文字已更新（\(output.transcript.count) 字）")
+                } else if let error = output.submissionError {
+                    self.log("流式输入暂停：\(error)")
+                }
+            case .failure(let error): self.log("流式识别失败：\(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func startTimers() {
+        stopTimers()
+        if configuration.silenceTimeout > 0 {
+            silenceTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+                guard let self, self.state == .streaming, self.detectedSpeech else { return }
+                if Date().timeIntervalSince(self.lastSpeechAt) >= self.configuration.silenceTimeout {
+                    self.log("检测到持续静音，自动结束")
+                    self.closeAndFinalize(reason: "silence")
+                }
+            }
+        }
+        keepAliveTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+            guard let self, self.state == .streaming else { return }
+            if let command = try? self.protocolHandler.keepAliveCommand(streamID: self.streamID) {
+                self.write(command)
+            }
+        }
+    }
+
+    private func closeAndFinalize(reason: String) {
+        if let command = try? protocolHandler.micCloseCommand(streamID: streamID) {
+            write(command)
+        }
+        finalizeRecording(reason: reason)
+    }
+
+    private func finalizeRecording(reason: String) {
+        guard state == .streaming || state == .opening else { return }
+        stopTimers()
+        let captured = samples
+        samples.removeAll(keepingCapacity: true)
+
+        guard captured.count >= (protocolHandler.codec?.sampleRate ?? 8_000) / 4 else {
+            log("录音过短，取消：\(captured.count) samples")
+            captureRecorder?.recordEvent(
+                type: "audio_discarded",
+                detail: "reason=\(reason) samples=\(captured.count)"
+            )
+            state = .ready
+            publishReadyStatus()
+            return
+        }
+
+        let rate = protocolHandler.codec?.sampleRate ?? 8_000
+        if configuration.mode == .capture, let captureRecorder {
+            let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+            let wavURL = captureRecorder.sessionDirectory.appendingPathComponent("audio-\(stamp).wav")
+            do {
+                try AudioPipeline.writeWAV(samples: captured, sampleRate: rate, to: wavURL)
+                try FileManager.default.setAttributes(
+                    [.posixPermissions: 0o600],
+                    ofItemAtPath: wavURL.path
+                )
+                captureRecorder.recordEvent(
+                    type: "audio_saved",
+                    detail: "reason=\(reason) samples=\(captured.count) rate=\(rate) file=\(wavURL.lastPathComponent)"
+                )
+                log("采集音频已保存：\(wavURL.path)")
+            } catch {
+                captureRecorder.recordEvent(type: "error", detail: "audio save: \(error.localizedDescription)")
+                log("采集音频保存失败：\(error.localizedDescription)")
+            }
+            state = .ready
+            log("采集继续：再次按语音键可记录下一段")
+            return
+        }
+
+        state = .ready
+        guard let speechJobs else {
+            log("本次处理失败：转写队列未初始化")
+            publish(.error("转写队列未初始化"))
+            return
+        }
+        let request = SpeechJobRequest(
+            samples: captured,
+            sampleRate: rate,
+            gainDB: configuration.gainDB,
+            outputDirectory: configuration.outputDirectory,
+            reason: reason,
+            submitToCodex: inputEnabled,
+            forceSubmit: configuration.forceSubmit,
+            streamingSessionID: usesStreamingInput ? dictationSessionID : nil,
+            isFinal: true
+        )
+        let accepted = speechJobs.enqueue(request) { [weak self] result in
+            guard let self else { return }
+            if let id = request.streamingSessionID { self.liveInput.end(id: id) }
+            switch result {
+            case .success(let output):
+                self.log("转写：\(output.transcript)")
+                self.log("录音保存：\(output.wavURL.path)")
+                if output.submitted {
+                    self.log("已填入 Codex 输入框，等待手动发送")
+                    self.publish(.sent)
+                } else if let submissionError = output.submissionError {
+                    self.log("本次提交失败：\(submissionError)")
+                    self.publish(.error(submissionError))
+                } else {
+                    self.publishReadyStatus()
+                }
+            case .failure(let error):
+                self.log("本次处理失败：\(error.localizedDescription)")
+                self.publish(.error(error.localizedDescription))
+            }
+            if self.shutdownRequested {
+                self.finishShutdownIfPossible()
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                    guard let self, self.state == .ready else { return }
+                    self.publishReadyStatus()
+                }
+            }
+        }
+        guard accepted else {
+            if let id = request.streamingSessionID { liveInput.end(id: id) }
+            log("转写队列已满（最多一条处理中、一条等待中），本次录音未提交")
+            publish(.error("转写队列已满，本次录音未提交"))
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                guard let self, self.state == .ready else { return }
+                self.publishReadyStatus()
+            }
+            return
+        }
+        publish(.processing(speechJobs.pendingCount))
+        log("录音结束 reason=\(reason)，已进入后台转写队列（待处理 \(speechJobs.pendingCount)）")
+        log("桥接已就绪：可以继续使用遥控器")
+    }
+
+    private func write(_ data: Data) {
+        guard let peripheral, let txCharacteristic else {
+            return fatal("TX characteristic 尚未就绪")
+        }
+        let type: CBCharacteristicWriteType =
+            txCharacteristic.properties.contains(.writeWithoutResponse)
+            ? .withoutResponse
+            : .withResponse
+        captureRecorder?.recordEvent(
+            type: "write",
+            characteristicUUID: txCharacteristic.uuid.uuidString,
+            data: data
+        )
+        peripheral.writeValue(data, for: txCharacteristic, type: type)
+    }
+
+    private func stopTimers() {
+        silenceTimer?.invalidate()
+        silenceTimer = nil
+        keepAliveTimer?.invalidate()
+        keepAliveTimer = nil
+    }
+
+    private func finishCapture(reason: String, status: Int32 = 0) {
+        guard configuration.mode == .capture, !isFinished else { return }
+        if state == .streaming || state == .opening {
+            closeAndFinalize(reason: reason)
+        }
+        central?.stopScan()
+        scanStopTimer?.invalidate()
+        scanStopTimer = nil
+        captureStopTimer?.invalidate()
+        captureStopTimer = nil
+        stopTimers()
+
+        do {
+            guard let recorder = captureRecorder else {
+                throw BridgeError.configuration("采集记录器未初始化")
+            }
+            let report = try recorder.finish(reason: reason)
+            log(
+                "采集完成：devices=\(report.summary.discoveredDevices) services=\(report.summary.services) characteristics=\(report.summary.characteristics) descriptors=\(report.summary.descriptors) values=\(report.summary.values) atvv=\(report.summary.atvvDetected)"
+            )
+            print("采集报告：\(recorder.reportURL.path)")
+            print("原始事件：\(recorder.eventsURL.path)")
+        } catch {
+            fputs("错误：无法完成采集报告：\(error.localizedDescription)\n", stderr)
+            exitStatus = 1
+        }
+        exitStatus = max(exitStatus, status)
+        isFinished = true
+        CFRunLoopStop(CFRunLoopGetMain())
+    }
+
+    private func characteristicPropertyNames(_ properties: CBCharacteristicProperties) -> [String] {
+        let known: [(CBCharacteristicProperties, String)] = [
+            (.broadcast, "broadcast"),
+            (.read, "read"),
+            (.writeWithoutResponse, "writeWithoutResponse"),
+            (.write, "write"),
+            (.notify, "notify"),
+            (.indicate, "indicate"),
+            (.authenticatedSignedWrites, "authenticatedSignedWrites"),
+            (.extendedProperties, "extendedProperties"),
+            (.notifyEncryptionRequired, "notifyEncryptionRequired"),
+            (.indicateEncryptionRequired, "indicateEncryptionRequired"),
+        ]
+        return known.compactMap { properties.contains($0.0) ? $0.1 : nil }
+    }
+
+    private func runDoctor() throws {
+        print("macOS: \(ProcessInfo.processInfo.operatingSystemVersionString)")
+        let codexRunning = !NSRunningApplication.runningApplications(
+            withBundleIdentifier: "com.openai.codex"
+        ).isEmpty
+        print("Codex: \(codexRunning ? "正在运行 (com.openai.codex)" : "未运行")")
+        print("辅助功能（当前进程）: \(AXIsProcessTrusted() ? "已授权" : "未授权")")
+        print("辅助功能提示: Terminal 启动的 doctor 不能代替 App 向导状态；请以双击遥声 App 后的检查为准")
+        let bluetoothAuthorization: String
+        switch CBManager.authorization {
+        case .allowedAlways: bluetoothAuthorization = "已授权"
+        case .denied: bluetoothAuthorization = "已拒绝"
+        case .restricted: bluetoothAuthorization = "受限制"
+        case .notDetermined: bluetoothAuthorization = "尚未请求"
+        @unknown default: bluetoothAuthorization = "未知"
+        }
+        print("蓝牙权限: \(bluetoothAuthorization)")
+        if configuration.speechEngine == "qwen" {
+            let qwen = try QwenRuntimeConfiguration.load()
+            print("语音引擎: Qwen3-ASR-1.7B · MLX 8 位 · 本地中文")
+            print("Qwen模型: \(qwen.modelPath)")
+        }
+        let whisper = configuration.whisperPath ?? "/opt/homebrew/bin/whisper-cli"
+        print("whisper-cli: \(FileManager.default.isExecutableFile(atPath: whisper) ? whisper : "未安装")")
+        if let attributes = try? FileManager.default.attributesOfItem(atPath: configuration.modelPath),
+            let size = attributes[.size] as? NSNumber
+        {
+            print(
+                "model: \(configuration.modelPath) (\(ByteCountFormatter.string(fromByteCount: size.int64Value, countStyle: .file)))"
+            )
+        } else {
+            print("model: 未下载")
+        }
+        print("output: \(configuration.outputDirectory)")
+        for line in CodexSubmitter().editorDiagnostics() {
+            print("Codex editor: \(line)")
+        }
+    }
+
+    private func requestAccessibilityAuthorization() {
+        let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
+        if AXIsProcessTrustedWithOptions(options) {
+            print("辅助功能权限已授权")
+        } else {
+            let appName = Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String ?? "语音桥接 App"
+            print("已请求辅助功能权限。请在系统设置中启用 \(appName)，然后重新运行 doctor 检查。")
+        }
+
+        print("若 Codex 输入区仍不可读取，请运行 ./scripts/codex-accessibility.sh enable --restart")
+    }
+
+    private func hex(_ data: Data) -> String {
+        data.map { String(format: "%02x", $0) }.joined(separator: " ")
+    }
+
+    private func log(_ message: String) {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss.SSS"
+        print("[\(formatter.string(from: Date()))] \(message)")
+        fflush(stdout)
+    }
+
+    private func fatal(_ message: String) {
+        if configuration.mode == .run { publish(.error(message)) }
+        fputs("错误：\(message)\n", stderr)
+        fflush(stderr)
+        if configuration.mode == .capture {
+            captureRecorder?.recordEvent(type: "fatal_error", detail: message)
+            finishCapture(reason: "fatal-error", status: 1)
+            return
+        }
+        central?.stopScan()
+        selectionTimer?.invalidate()
+        reconnectTimer?.invalidate()
+        stopCapabilityNegotiation()
+        stopTimers()
+        exitStatus = 1
+        isFinished = true
+        CFRunLoopStop(CFRunLoopGetMain())
+    }
+
+    func requestVoiceRetry(trigger: String) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.requestVoiceRetry(trigger: trigger)
+            }
+            return
+        }
+        guard configuration.mode == .run,
+            !shutdownRequested,
+            central?.state == .poweredOn,
+            voiceReconnectSleeping || reconnectTimer != nil
+        else { return }
+
+        voiceReconnectSleeping = false
+        voiceReconnectPolicy.reset()
+        log("唤醒语音连接：\(trigger)")
+        publish(.searching)
+        startScan()
+    }
+
+    @objc private func voiceConnectionModeChanged(_ notification: Notification) {
+        inputEnabled = AppPreferencesStore().load().preferences.submissionMode == .codex
+        let snapshot = AppPreferencesStore().load()
+        if case .unsupportedVersion(let version) = snapshot.state {
+            fputs("运行时未更新语音连接模式：schema v\(version) 过新\n", stderr)
+            return
+        }
+        applyVoiceConnectionMode(snapshot.preferences.voiceConnectionMode)
+    }
+
+    private func applyVoiceConnectionMode(_ mode: VoiceConnectionMode) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.applyVoiceConnectionMode(mode)
+            }
+            return
+        }
+        guard configuration.mode == .run, voiceReconnectPolicy.mode != mode else { return }
+
+        voiceReconnectPolicy.updateMode(mode)
+        voiceReconnectSleeping = false
+        log("语音连接模式已更新：\(mode.displayName)")
+
+        if state == .disconnected, peripheral == nil, central?.state == .poweredOn {
+            publish(.searching)
+            startScan()
+        }
+    }
+
+    func requestShutdown() {
+        guard configuration.mode == .run, !shutdownRequested else { return }
+        shutdownRequested = true
+        publish(.stopping)
+        if state == .streaming || state == .opening {
+            closeAndFinalize(reason: "app-quit")
+        }
+        finishShutdownIfPossible()
+    }
+
+    private func finishShutdownIfPossible() {
+        guard shutdownRequested, speechJobs?.pendingCount ?? 0 == 0 else { return }
+        central?.stopScan()
+        selectionTimer?.invalidate()
+        reconnectTimer?.invalidate()
+        stopCapabilityNegotiation()
+        if let peripheral { central?.cancelPeripheralConnection(peripheral) }
+        stopTimers()
+        isFinished = true
+        CFRunLoopStop(CFRunLoopGetMain())
+    }
+
+    private func publishReadyStatus() {
+        guard configuration.mode == .run, !shutdownRequested else { return }
+        if state == .streaming || state == .opening {
+            publish(.recording)
+            return
+        }
+        let pending = speechJobs?.pendingCount ?? 0
+        publish(pending > 0 ? .processing(pending) : (speechModelReady ? .ready : .warmingModel))
+    }
+
+    private func publish(_ status: MiAoRuntimeStatus) {
+        statusHandler?(status)
+    }
+}

@@ -1,0 +1,117 @@
+> Historical upstream reference / 上游历史资料：本页保留 MI-AO 原始说明，可能与 RemoteVoice 当前行为不同。当前安装、功能与限制请以[项目首页](../README.md)为准。
+
+<!-- Copyright (c) 2026 FanXeon@Poemcoder with Codex -->
+
+# 3-minute quick start
+
+[中文](QUICKSTART.md) · [Back to README](../README_EN.md)
+
+## Requirements
+
+- macOS 14 or later;
+- Xcode Command Line Tools and Homebrew;
+- the Codex macOS app;
+- a BLE voice remote.
+
+The fully verified device is Xiaomi Bluetooth Remote Control 2 Pro firmware 2671. Check the [compatibility matrix](COMPATIBILITY.md) before assuming another remote works.
+
+## 1. Install
+
+```bash
+git clone https://github.com/fanxeon/mi-ao.git
+cd mi-ao
+./scripts/setup.sh
+```
+
+The app is installed to `~/Applications/米遥.app`, the model to `~/.cache/mi-ao`, and recordings to `~/Library/Application Support/mi-ao/recordings`. The setup guide opens automatically when installation finishes. The app bundles the signed daily start, safe stop, button gate, mapping recovery, and speech-engine repair runtime. After first install, normal Finder-based use does not depend on the repository remaining at its original path; updates, reinstalls, and developer diagnostics still use the source tree.
+
+V2 refuses to replace a running app, signature-verifies a staged bundle before an atomic swap, and restores the previous app if a later install step fails. The Whisper model is downloaded to a temporary file and replaces the existing model only after its pinned SHA-256 matches.
+
+MI-AO currently uses a local source build and ad-hoc signing. Do not download unofficial "unsigned" or "quarantine-free" DMGs.
+
+## 2. Pair from the guide
+
+Complete the Bluetooth card in the setup guide and choose “配对遥控器”. On the Xiaomi Bluetooth Remote Control 2 Pro, **press and hold Menu + `HOME` simultaneously** until it appears under Nearby Devices. Click Connect and wait for the Connected status. Pairing shortcuts for other remotes may differ; see the device manual and the [complete pairing guide](PAIRING_EN.md).
+
+Back in Permissions & Connection, choose Scan Remotes to inspect real CoreBluetooth results. Keep automatic arbitration for one remote, or select and persist a specific target when multiple compatible remotes are present. The saved UUID is preferred on later reconnects.
+
+## 3. Choose features and complete the real checks
+
+First choose automatic Codex submission, remote button control, and optional Launch at Login. The guide labels macOS, the local engine, Accessibility, Bluetooth, Codex, and the bundled launcher as Required, Required by enabled features, or Optional.
+
+In the default full mode, Accessibility and Codex are feature-required. Turn off both submission and button control and they immediately become optional. Launch at Login is always optional. See [Permissions and optional features](PERMISSIONS_EN.md).
+
+When Accessibility is required, grant it to the installed MI-AO app, not a temporary binary inside `.build`. Only automatic submission needs Codex composer compatibility. A busy process is never restarted without explicit confirmation.
+
+## 4A. Start the verified Xiaomi Remote 2 Pro
+
+Choose “连接遥控器并开始”. The guide calls the app-bundled copy of the same real launch gate as `./scripts/start.sh`, closes after success and leaves MI-AO in the menu bar.
+
+The first successful start saves the feature choices to `preferences.json`. Later manual app launches and optional login launches use the same preferences and the same guarded startup path; failure reopens the guide.
+
+Click the menu-bar icon and wait for the ready state. Then hold the remote's voice button, speak and release. The panel also provides Codex focus, recordings, setup diagnostics and safe exit.
+
+## 4B. Bring up another remote
+
+```bash
+./scripts/capture.sh --scan-seconds 30
+./scripts/capture.sh --identifier <UUID> --capture-seconds 60 --debug
+```
+
+During capture, test a short press, hold-to-talk and release, a second press, and silence. Reports are stored under `~/Library/Application Support/mi-ao/captures`.
+
+Device identity is redacted by default, but raw `events.jsonl` payloads still require manual review before sharing. Follow the complete [hardware bring-up guide](HARDWARE_BRINGUP.md).
+
+## 5. Terminal fallback and the default pointer preset
+
+Xiaomi Remote 2 Pro firmware 2671 ships with a built-in twelve-key hardware profile, so a clean install needs no recalibration. The terminal fallback uses the same gate:
+
+```bash
+./scripts/start.sh
+```
+
+The wrapper runs `check-buttons` first. It changes the system only after Accessibility permission and the button runtime are both ready, then generates neutralization from the same hardware profile.
+
+If Codex is closed, `start.sh` launches it with the per-process compatibility argument. If a busy Codex process is already running without that argument, MI-AO exits before changing the remote mapping and never restarts Codex automatically.
+
+If the same model behaves differently, uses another firmware, or you are bringing up another remote, stop MI-AO and calibrate:
+
+```bash
+./scripts/debug-buttons.sh \
+  --name "小米蓝牙语音遥控器" \
+  --preset pointer
+```
+
+Local confirmed results override the built-in baseline in time order. Explicit invalidation, a missing required button, or duplicate Usage makes `check-buttons` fail before any system mapping is changed.
+
+Use `--button tv` or `--button power` to retest one key. Verified Xiaomi Remote 2 Pro firmware 2671 values are `TV=0x07/0x35` and `Power=0x07/0x66`; an infrared-only button on another remote cannot be handled by the Mac.
+
+All four directions passed direct cursor positioning with real-coordinate monitoring. The complete button mode remains an implementation preview until mode switching and Power complete acceptance. Add `--no-buttons` for an explicit voice-only run. The wrapper restores on exit and refuses to overwrite an existing user `UserKeyMapping`.
+
+## Useful options
+
+```bash
+# Transcribe without submitting
+./scripts/run.sh --name "<device name>" --no-submit
+
+# Override Whisper vocabulary context
+./scripts/run.sh --name "<device name>" --prompt "MI-AO. Codex. Your project terms."
+
+# Print raw GATT data for local debugging
+./scripts/run.sh --name "<device name>" --debug
+
+# Explicit voice-only fallback
+./scripts/run.sh --name "<device name>" --no-buttons
+```
+
+## Verify, stop, and uninstall
+
+```bash
+./scripts/verify-install.sh
+```
+
+- Stop from the menu bar with “安全退出并恢复遥控器”, or run `./scripts/stop.sh`.
+- Remove the app while retaining models and recordings with `./scripts/uninstall.sh`.
+- Remove all local MI-AO data with `./scripts/uninstall.sh --all-data`.
+
+Continue with the [complete usage guide](USAGE_EN.md) after installation. See [Troubleshooting](TROUBLESHOOTING_EN.md) if the first run does not complete.

@@ -1,0 +1,21 @@
+# Copyright (c) 2026 FanXeon@Poemcoder with Codex
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: swift --version
+      - name: Full delivery check
+        run: make check

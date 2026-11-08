@@ -1,0 +1,90 @@
+#!/bin/zsh
+# Copyright (c) 2026 FanXeon@Poemcoder with Codex
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$ROOT/scripts/lib/project.sh"
+TEMP_ROOT="$(mktemp -d)"
+trap 'rm -rf "$TEMP_ROOT"' EXIT
+
+[[ -x "$ROOT/scripts/start.sh" ]]
+[[ -x "$ROOT/scripts/stop.sh" ]]
+[[ -x "$ROOT/scripts/codex-accessibility.sh" ]]
+[[ -x "$ROOT/scripts/build-icon.sh" ]]
+[[ -x "$ROOT/scripts/repair-runtime.sh" ]]
+zsh -n \
+  "$ROOT/scripts/authorize.sh" \
+  "$ROOT/scripts/build-icon.sh" \
+  "$ROOT/scripts/install-app.sh" \
+  "$ROOT/scripts/run.sh" \
+  "$ROOT/scripts/run-with-mapping.sh" \
+  "$ROOT/scripts/repair-runtime.sh" \
+  "$ROOT/scripts/start.sh" \
+  "$ROOT/scripts/stop.sh" \
+  "$ROOT/scripts/codex-accessibility.sh"
+zsh -n "$ROOT/scripts/lib/environment.sh"
+
+"$ROOT/scripts/build-app.sh" >/dev/null
+
+BUILT_PROFILE="$BUILD_APP/Contents/Resources/HardwareProfiles/xiaomi-remote-2-pro-2671.plist"
+BUILT_ICON="$BUILD_APP/Contents/Resources/AppIcon.icns"
+BUILT_BRAND="$BUILD_APP/Contents/Resources/Brand"
+BUILT_RUNTIME="$BUILD_APP/Contents/Resources/Runtime"
+[[ -x "$BUILD_APP/Contents/MacOS/$EXECUTABLE_NAME" ]]
+if LC_ALL=C grep -aFq "$ROOT/" "$BUILD_APP/Contents/MacOS/$EXECUTABLE_NAME"; then
+  echo "发布程序残留源码构建目录" >&2
+  exit 1
+fi
+[[ -s "$BUILD_APP/Contents/Resources/LICENSE" ]]
+[[ -s "$BUILD_APP/Contents/Resources/NOTICE" ]]
+[[ -x "$BUILT_RUNTIME/scripts/configure-qwen.sh" ]]
+[[ -f "$BUILT_PROFILE" ]]
+[[ -s "$BUILT_ICON" ]]
+[[ -s "$BUILT_BRAND/mi-ao-symbol-gradient.svg" ]]
+[[ -s "$BUILT_BRAND/mi-ao-symbol-gradient-1024.png" ]]
+[[ -s "$BUILT_BRAND/mi-ao-symbol-template.svg" ]]
+[[ -s "$BUILT_BRAND/mi-ao-symbol-template-1024.png" ]]
+[[ -s "$BUILT_BRAND/mi-ao-menubar-sun-template.svg" ]]
+[[ -s "$BUILT_BRAND/LUCIDE_LICENSE.txt" ]]
+[[ -x "$BUILT_RUNTIME/scripts/start.sh" ]]
+[[ -x "$BUILT_RUNTIME/scripts/stop.sh" ]]
+[[ -x "$BUILT_RUNTIME/scripts/run-with-mapping.sh" ]]
+[[ -x "$BUILT_RUNTIME/scripts/repair-runtime.sh" ]]
+[[ -f "$BUILT_RUNTIME/scripts/lib/environment.sh" ]]
+[[ -f "$BUILD_APP/Contents/Resources/WhisperModel.sha256" ]]
+[[ -f "$BUILT_RUNTIME/Resources/WhisperModel.sha256" ]]
+"$BUILD_APP/Contents/MacOS/$EXECUTABLE_NAME" --help | grep -q "setup"
+otool -L "$BUILD_APP/Contents/MacOS/$EXECUTABLE_NAME" | grep -q "ServiceManagement.framework"
+"$BUILT_RUNTIME/scripts/run.sh" --help | grep -q "setup"
+
+RELOCATED_APP="$TEMP_ROOT/Relocated/遥声.app"
+mkdir -p "${RELOCATED_APP:h}"
+ditto "$BUILD_APP" "$RELOCATED_APP"
+"$RELOCATED_APP/Contents/Resources/Runtime/scripts/run.sh" --help \
+  | grep -q "setup"
+codesign --verify --deep --strict "$RELOCATED_APP"
+
+cmp "$ROOT/Resources/HardwareProfiles/xiaomi-remote-2-pro-2671.plist" "$BUILT_PROFILE"
+cmp "$ROOT/Resources/Brand/mi-ao-symbol-gradient.svg" "$BUILT_BRAND/mi-ao-symbol-gradient.svg"
+cmp "$ROOT/Resources/Brand/mi-ao-symbol-gradient-1024.png" "$BUILT_BRAND/mi-ao-symbol-gradient-1024.png"
+cmp "$ROOT/Resources/Brand/mi-ao-symbol-template.svg" "$BUILT_BRAND/mi-ao-symbol-template.svg"
+cmp \
+  "$ROOT/Resources/Brand/mi-ao-menubar-sun-template.svg" \
+  "$BUILT_BRAND/mi-ao-menubar-sun-template.svg"
+cmp "$ROOT/Resources/Brand/LUCIDE_LICENSE.txt" "$BUILT_BRAND/LUCIDE_LICENSE.txt"
+cmp \
+  "$ROOT/Resources/Brand/mi-ao-symbol-template-1024.png" \
+  "$BUILT_BRAND/mi-ao-symbol-template-1024.png"
+cmp \
+  "$ROOT/Resources/HardwareProfiles/xiaomi-remote-2-pro-2671.plist" \
+  "$BUILT_RUNTIME/Resources/HardwareProfiles/xiaomi-remote-2-pro-2671.plist"
+cmp "$ROOT/scripts/lib/environment.sh" "$BUILT_RUNTIME/scripts/lib/environment.sh"
+cmp "$ROOT/Resources/WhisperModel.sha256" "$BUILD_APP/Contents/Resources/WhisperModel.sha256"
+cmp "$ROOT/Resources/WhisperModel.sha256" "$BUILT_RUNTIME/Resources/WhisperModel.sha256"
+plutil -lint "$BUILD_APP/Contents/Info.plist" "$BUILT_PROFILE" >/dev/null
+plutil -lint "$BUILT_RUNTIME/Resources/Info.plist" >/dev/null
+[[ "$(plutil -extract CFBundleIconFile raw "$BUILD_APP/Contents/Info.plist")" == "AppIcon" ]]
+/usr/bin/sips -g format "$BUILT_ICON" | grep -q "icns"
+codesign --verify --deep --strict "$BUILD_APP"
+
+echo "App bundle tests: OK"

@@ -1,0 +1,6 @@
+# Copyright (c) 2026 FanXeon@Poemcoder with Codex
+blank_issues_enabled: false
+contact_links:
+  - name: Security report
+    url: https://github.com/win060787-del/xiaomi-remote-vibe-coding-codex-macos/security/advisories/new
+    about: 安全问题请使用 GitHub 私密漏洞报告，不要创建公开 Issue。

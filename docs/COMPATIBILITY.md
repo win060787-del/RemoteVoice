@@ -1,0 +1,68 @@
+> Historical upstream reference / 上游历史资料：本页保留 MI-AO 原始说明，可能与 RemoteVoice 当前行为不同。当前安装、功能与限制请以[项目首页](../README.md)为准。
+
+<!-- Copyright (c) 2026 FanXeon@Poemcoder with Codex -->
+
+# 兼容性矩阵 / Compatibility Matrix
+
+[返回中文首页](../README.md) · [Back to English README](../README_EN.md)
+
+米遥只把“有真实硬件证据”的设备标记为兼容。代码里存在某个协议分支，不等于某款遥控器已经验证。
+
+MI-AO marks a device compatible only when reproducible evidence exists from real hardware. A protocol implementation in source code is not a device compatibility claim.
+
+## 状态 / Status
+
+- ✅ **End-to-end verified**：配对、GATT、按键、音频、转写和 Codex 提交全部通过。
+- 🧪 **Implementation only**：有代码和 fixture，但缺少指定设备真机证据。
+- 🧩 **Community evidence needed**：协议待识别或适配。
+
+## 设备 / Devices
+
+| 设备 / Device | 固件 / Firmware | macOS 设备名 | 协议 / Protocol | 控制 / Control | 转写 | Codex | 状态 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 小米蓝牙遥控器 2 Pro | 2671 | `小米蓝牙语音遥控器` | ATVV v1.0, ADPCM 16 kHz, 120 B | Hold-to-Talk, release `AUDIO_STOP` | ✅ 中文 | ✅ 真实提交 | ✅ End-to-end |
+| 通用 ATVV v0.4 遥控器 | 未指定 | 未指定 | ATVV v0.4, ADPCM 8/16 kHz | 代码支持 | 代码支持 | 未实测 | 🧪 Implementation only |
+| 其他 ATVV v1.0 遥控器 | 未指定 | 未指定 | ATVV v1.0, ADPCM 8/16 kHz | 代码支持 | 代码支持 | 未实测 | 🧪 Implementation only |
+
+## 已验证的小米 2 Pro 证据
+
+- 标准 ATVV Service：`AB5E0001-5A21-4F05-BC7D-AF01F617B664`；
+- ATVV v1.0 capabilities：ADPCM 16 kHz、Hold-to-Talk、120 字节帧；
+- 按住后收到 `AUDIO_START`，松手收到 `AUDIO_STOP`；
+- 连续音频 notify 解码为 16 kHz WAV；
+- 本地 Whisper 可正确识别真实中文语音；
+- 历史真机验收曾在 Codex Accessibility 树中找到唯一 `AXTextArea` 后完成真实提交；Codex 26.707+ 需要带 `--force-renderer-accessibility` 启动当前进程，等待本轮真机复验后更新为新链路证据；
+- 验证日期：2026-07-14。
+
+### 实体按键证据
+
+- HID 设备身份：Vendor `0x2717` / Product `0x32B8`；
+- `learn-buttons` 会按该 Vendor/Product 精确过滤设备，不记录 Mac 键盘事件；
+- 返回键已在独立 20 秒窗口中重复采集，Keyboard Usage Page `0x07` / Usage `0xF1`，按下与松手均已观察；
+- 返回键已通过新格式 `confirmed_calibration` 人工确认；硬件档案只记录 `back`，默认 `pointer` 预设将其映射为 Escape；
+- `TV` 键已通过新格式 `confirmed_calibration` 确认：Keyboard Usage Page `0x07` / Usage `0x35`，按下与松手完整；
+- 电源键已通过新格式 `confirmed_calibration` 确认：Keyboard Usage Page `0x07` / Usage `0x66`（Keyboard Power），按下与松手完整；
+- 音量加减已通过新格式 `confirmed_calibration` 确认：Keyboard Usage Page `0x07` / Usage `0x80`、`0x81`，按下与松手完整；
+- 音量加减已完成动作层真机验收：分别执行 Codex 上一个/下一个会话，系统音量不变化，菜单直调实现未观察到 Command、Shift、Option 或 Control 状态残留；
+- 接管边界：方向六键、HOME `0x4A`、TV、电源、语音 HID `0x3E` 和音量加减共十二键进入 `No Event`；菜单不进入米遥映射并沿用 macOS 原生鼠标右键；
+- 六个必需按钮已完成新格式确认：上 `0x52`、下 `0x51`、左 `0x50`、右 `0x4F`、确认 `0x28`、返回 `0xF1`，均含按下和松手；
+- 四个方向均完成真机坐标监测：`CGWarpMouseCursorPosition` 返回成功，系统鼠标对应 X/Y 坐标按方向变化；未发现全局快捷键或第三方重映射冲突；
+- 全键首轮扫描曾观察到 12/13 项事件，但存在操作提示错位；正式键码表只采用后来逐键取得的新格式确认结果；
+- 音量加减动作已经完成真机验收；HOME 单/双击、`TV` 模式切换和电源启动/聚焦仍需逐项动作层验收。菜单键明确沿用 macOS 原生鼠标右键，不属于米遥动作验收范围。
+
+不公开真机 MAC、CoreBluetooth peripheral UUID 或设备序列信息。
+
+## 贡献新设备 / Contribute a device
+
+1. 在 macOS 中配对设备；
+2. 运行脱敏扫描和定向采集；
+3. 人工复核 `report.json` 和 `events.jsonl`；
+4. 使用 [Device support request](../.github/ISSUE_TEMPLATE/device_support.yml) 模板提交 Issue；
+5. 只在证据充足后增加新 transport / protocol adapter 和脱敏 fixture。
+
+```bash
+./scripts/capture.sh --scan-seconds 30
+./scripts/capture.sh --identifier <UUID> --capture-seconds 60 --debug
+```
+
+Required evidence: model, firmware, macOS version, service and characteristic UUIDs, control behavior, audio frame shape, a non-private test phrase, and redacted logs. Never upload personal speech, MAC addresses, peripheral UUIDs, serial numbers, usernames, or secrets.

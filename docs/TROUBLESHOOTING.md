@@ -1,0 +1,185 @@
+> Historical upstream reference / 上游历史资料：本页保留 MI-AO 原始说明，可能与 RemoteVoice 当前行为不同。当前安装、功能与限制请以[项目首页](../README.md)为准。
+
+<!-- Copyright (c) 2026 FanXeon@Poemcoder with Codex -->
+
+# 故障排查
+
+[English](TROUBLESHOOTING_EN.md) · [配对与连接](PAIRING.md) · [快速开始](QUICKSTART.md)
+
+## 先运行诊断
+
+```bash
+./scripts/verify-install.sh
+```
+
+它会检查 App、Bundle ID、签名、Codex 进程、蓝牙权限、辅助功能、Codex 输入控件、`whisper-cli` 和模型。
+
+同时检查遥控器映射状态：
+
+```bash
+./scripts/remote-mapping.sh status
+```
+
+如果异常退出后仍显示“米遥中性映射”，保持遥控器连接并运行 `./scripts/remote-mapping.sh restore`。脚本检测到其他用户映射时会拒绝删除。
+
+若前台调试终端显示 `suspended`，说明误按了 `Control + Z`。包装脚本会捕获暂停信号、终止子进程并恢复映射。日常停止使用菜单栏“安全退出并恢复遥控器”或 `./scripts/stop.sh`。
+
+## 米遥正在运行，但菜单栏看不到图标
+
+先双击 `~/Applications/米遥.app`。如果打开的设置页显示“米遥当前已经运行”，说明后台运行态存在，不要再反复启动。
+
+在刘海屏 MacBook 上，右侧常驻项过多时，macOS 可见宽度不足，米遥状态项可能被刘海遮挡。这是菜单栏布局边界，不是米遥闪退。
+
+1. 暂时退出不需要的菜单栏常驻应用，释放右侧宽度；
+2. 有外接显示器时，可在无刘海菜单栏上确认米遥状态项；
+3. 仍无法使用菜单栏安全退出时，在项目目录运行 `./scripts/stop.sh`，它会结束运行态并恢复遥控器映射。
+
+只有在右侧已有足够空间、重新启动后仍看不到时，才按真实菜单栏状态项故障继续排查。
+
+## macOS 蓝牙页看不到遥控器
+
+1. 打开“系统设置 → 蓝牙”；
+2. 在小米蓝牙遥控器 2 Pro 上同时长按菜单键 + `HOME`；
+3. 设备出现后点击“连接”，等待“已连接”状态。
+
+如果仍不出现，检查电池，把遥控器放到 Mac 附近，并临时关闭原电视或机顶盒的蓝牙。完整的忽略设备、重新配对和首次安全测试步骤见 [配对与首次连接指南](PAIRING.md)。
+
+## 启动后找不到遥控器
+
+- 先区分问题所在：macOS 未显示“已连接”时，先重做系统配对；macOS 已连接但终端找不到时，再检查设备名、权限和米遥进程；
+- 确认 macOS 蓝牙页显示设备已连接；
+- 已连接设备可能停止普通广播，优先使用 `--name`；
+- 设备名称必须与 macOS 显示名称的一部分匹配；
+- 不要同时启动两个米遥进程。
+
+`start.sh` 会拒绝第二个实例并显示现有进程号。若状态已经失效，运行 `./scripts/stop.sh` 清理并确认映射恢复后再启动。
+
+```bash
+./scripts/run.sh --name "小米蓝牙语音遥控器"
+```
+
+## 菜单栏持续重连或显示“智能休眠”
+
+这表示遥控器没有回应 ATVV 能力协商。先在“设置与诊断 → 使用偏好 → 语音连接”确认当前策略：
+
+- “随时就绪”是默认值；会从 1 秒逐步降频，最终每 60 秒恢复一次，不会只试几秒就放弃；
+- “智能休眠”会在两次快速自动恢复后停止后台握手，菜单栏显示“按键即可唤醒”；
+- 两种模式下，实体按键链路都独立运行；已识别的 HID 按键活动会打断倒计或唤醒休眠；
+- 点击菜单栏中的“立即重试语音连接 / 唤醒语音连接”，或重新开启系统蓝牙，也会立即恢复；
+- 连续失败时不要反复重启 App；确认目标设备，再查看 `~/Library/Application Support/mi-ao/logs/mi-ao.log` 中的订阅和 `GET_CAPS` 记录。
+
+## 按键后完全没反应
+
+终端应先显示“桥接已就绪”。如果没有：
+
+1. 菜单栏安全退出或运行 `./scripts/stop.sh`；前台调试时按 `Control + C`；
+2. 重新确认蓝牙连接；
+3. 运行 `./scripts/verify-install.sh`；
+4. 用 `--debug` 重启并查看是否出现 `AUDIO_START`。
+
+## 有转写，但没有发送到 Codex
+
+米遥会在安全检查失败时把 transcript 复制到剪贴板。常见日志：
+
+- `Codex 未运行`：先打开 Codex App；
+- `尚未授予辅助功能权限`：给 `~/Applications/米遥.app` 授权；
+- `候选输入控件：0`：运行 `./scripts/codex-accessibility.sh enable --restart`，进入一个可编辑的 Codex 任务后重试；
+- `无法安全聚焦唯一的 Codex 输入框`：先检查兼容状态，再关闭遮住输入区的弹窗或多编辑器状态。
+
+先运行以下命令确认兼容状态：
+
+```bash
+./scripts/codex-accessibility.sh status
+./scripts/authorize.sh
+```
+
+兼容参数只影响本次 Codex 进程，不修改偏好设置、不开放调试端口。Codex 退出后即失效；需要立即撤销时运行 `./scripts/codex-accessibility.sh disable --restart`。
+
+不要把 `--force-submit` 当作日常解决方案。它会跳过编辑器唯一性检查。
+
+## 系统设置显示“米遥”已开启，但向导仍说未授权
+
+这是 source-first ad-hoc 签名更新后的身份变化，不是你没有开启权限。系统设置中的旧条目仍可显示为开启，但它绑定的是上一版 App 的 CDHash，当前构建不会继承。
+
+1. 在“系统设置 → 隐私与安全性 → 辅助功能”中选中旧“米遥”，点击 `-` 移除；
+2. 点击 `+`，重新选择 `~/Applications/米遥.app`；
+3. 开启新条目。保持设置向导打开，它会在 1.5 秒内自动变成绿色，无需重启米遥。
+
+也可以在向导点击“修复权限”，它会同时打开正确的系统设置页面并在 Finder 中显示当前 App。`./scripts/authorize.sh` 现在只打开这个真实 App 向导，不再用 Terminal 子进程给出可能误导的授权状态。
+
+## 语音可用，但鼠标模式没有启动
+
+这是安全降级，不代表语音故障。先看终端给出的具体原因：
+
+- “缺少人工确认校准”：运行 `./scripts/debug-buttons.sh --name "小米蓝牙语音遥控器"`，至少确认方向四键、中间确认和返回；
+- “按键校准冲突”：两个实体按钮被确认成同一 Usage，分别使用 `--button <标识>` 重测；
+- “需要辅助功能权限”：运行 `./scripts/authorize.sh`，在系统设置中授权已安装的米遥 App 后重启；
+- 指定 `--button-profile` 后失败：确认它是 `captureMode=confirmed_calibration` 的新格式完整档案，而不是 `learn-buttons` 自动学习报告。
+
+只使用语音、暂不处理鼠标问题：
+
+```bash
+./scripts/run.sh --name "小米蓝牙语音遥控器" --no-buttons
+```
+
+完整门禁和映射见 [按键预设与默认指针模式](BUTTON_PRESETS.md)。
+
+## `TV` 不切换模式，或电源键不启动 Codex
+
+这两个键不是基础六键门禁的一部分，必须分别校准：
+
+```bash
+./scripts/debug-buttons.sh --name "小米蓝牙语音遥控器" --button tv
+./scripts/debug-buttons.sh --name "小米蓝牙语音遥控器" --button power
+```
+
+小米 2 Pro 固件 2671 的已验证结果是 `TV=0x07/0x35`、电源 `0x07/0x66`。如果同型号结果不同，先不要确认并检查固件；其他遥控器若始终没有电源键 HID 事件，则可能只发送红外信号。若终端显示“未找到 Codex App”，请确认官方 Codex macOS App 已安装且 bundle ID 为 `com.openai.codex`。
+
+## 校准时前台 App 也响应了方向键
+
+`debug-buttons` 不会合成米遥动作，但 macOS 仍可能处理遥控器原始 HID 键。请停止校准，聚焦到空白且不会因方向键、返回键丢失内容的窗口，再重新运行。不要在未保存的编辑器、文件列表或删除确认框中校准。
+
+## 音量键不切换 Codex 会话
+
+先确认 Codex 已运行，并在 Codex 的“View”菜单中能看到 `Previous Task` / `Next Task`。再分别运行 `debug-buttons.sh --button volume_up` 和 `--button volume_down`；小米 2 Pro 固件 2671 的确认值应为 `0x07/0x80`、`0x07/0x81`。米遥通过 Accessibility 直接执行菜单项，不会合成组合键；若键盘出现修饰键卡住，应立即停止并报告，不能视为正常行为。
+
+## 指针动作和前台 App 同时响应
+
+立即从菜单栏安全退出或运行 `./scripts/stop.sh`，然后运行 `./scripts/remote-mapping.sh status`。正常状态应显示当前设备的十二个接管键均映射为 `No Event`，菜单不在映射内并继续作为 macOS 原生鼠标右键。若状态缺失或回读不一致，先执行 `./scripts/remote-mapping.sh restore`，再通过 `./scripts/start.sh` 启动；不要用全局键盘重映射作为绕过方案。
+
+米遥不建立全局 Quartz 键盘事件 tap。若 Mac 实体键盘出现按键丢失或修饰键卡住，应立即停止米遥并提交脱敏日志，这是安全缺陷而不是可接受的已知限制。
+
+## 中文术语识别错误
+
+使用短词表，不要把长句当作 prompt：
+
+```bash
+./scripts/run.sh \
+  --name "<设备名>" \
+  --prompt "米遥。Codex。项目名。专有术语。"
+```
+
+长句 prompt 可能被小模型当成要续写的文本，导致重复尾句。
+
+## 重新安装后权限失效
+
+App 被重建或覆盖后，macOS 可能要求重新确认辅助功能。平时不要反复运行 `install-app.sh`。
+
+## “登录时启动”显示不可用或需要允许
+
+- “需要允许”：打开“系统设置 → 通用 → 登录项与扩展”允许米遥；这是可选项，不处理也能手动启动。
+- “不可用”：确认运行的是 `~/Applications/米遥.app`，不是 `dist` 或 `.build` 临时产物；可点击一次开关让当前安装版直接重试系统注册，失败时米遥会显示 `SMAppService` 的真实错误。仍失败再运行 `./scripts/setup.sh`。
+- source-first ad-hoc 更新可能改变代码签名身份；如果旧登录项仍在但新 App 无法启用，先关闭旧项，再从当前安装版重新开启。
+- 米遥只接受 `SMAppService` 的真实状态，不会用本地布尔值伪装成功。完整边界见 [权限与可选功能](PERMISSIONS.md)。
+
+## 转写文件在哪里
+
+```text
+~/Library/Application Support/mi-ao/recordings
+```
+
+每次运行会保留 WAV 和 `.txt` transcript，便于确认是音频、Whisper 还是 Codex 提交问题。这些文件可能含私人语音，不要上传到公开 Issue。
+
+## 仍然无法解决
+
+使用 Bug Report Issue 模板，提供版本、macOS、遥控器型号/固件和已脱敏日志。安全问题不要创建公开 Issue，请按 [SECURITY.md](../SECURITY.md) 报告。
