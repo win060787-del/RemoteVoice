@@ -1,7 +1,7 @@
 {
   "display_name": "小米遥控器 Vibe Coding Codex for macOS",
   "repository": "win060787-del/xiaomi-remote-vibe-coding-codex-macos",
-  "description": "Xiaomi Bluetooth Voice Remote 2 Pro companion for Codex on macOS: local Whisper/Qwen speech-to-text, pointer and keyboard modes, configurable mappings, battery monitoring, and a native interactive 3D interface for Vibe Coding; derived from MI-AO.",
+  "description": "Use a Xiaomi Bluetooth Voice Remote 2 Pro with Codex on macOS. Hold to dictate with local Whisper or Qwen, review the transcript before sending, and switch between mouse and keyboard controls. Includes custom mappings, device scanning, battery status, and an interactive 3D remote. Based on MI-AO.",
   "topics": [
     "macos",
     "swift",

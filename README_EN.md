@@ -20,6 +20,17 @@ RemoteVoice connects a supported ATVV Bluetooth voice remote to macOS. Hold the 
 
 Development version **0.2.2**, derived from [fanxeon/mi-ao](https://github.com/fanxeon/mi-ao), with the original MIT license and attribution retained. This source-first development build is intended for users willing to help test hardware compatibility and local recognition.
 
+## A typical session
+
+Open Codex on the Mac, choose the task you want to continue, and click the composer. Hold the remote’s voice button, say “Review the changes in this branch and flag anything that could affect sign-in,” then release. With **Insert into editor** enabled, the transcript goes to the Codex composer. Leave automatic sending off to correct filenames, commands, or project terms before you send it.
+
+| What you want to do | How to do it |
+| --- | --- |
+| Dictate a longer instruction | Configure Qwen and select segmented transcription. Text updates as you speak and is corrected after release |
+| Keep a local voice note | Turn off editor insertion and open the recordings and transcripts folder from the menu bar |
+| Review results and change tasks | Tap HOME to page down or double-tap to page up. Use the volume buttons to select Codex sidebar items |
+| Switch between pointer and keyboard navigation | Press TV. Pointer mode moves the cursor with the D-pad. Focus mode sends arrow keys and Return |
+
 ## 🖼️ Preview
 
 These images are native renders of the current AppKit / SceneKit interface using an isolated configuration, not design mockups. They demonstrate the UI rather than successful hardware or speech acceptance. They contain no user recordings, device UUIDs, or personal model paths.
@@ -88,6 +99,17 @@ Setup checks the environment, prepares the Whisper small multilingual model (abo
 
 The connection indicator describes the Bluetooth link, not voice bridge readiness. A question mark inside the battery means no valid reading is available. Some preferences require restarting dictation; hover over the relevant option for its conditions.
 
+### Verify the first session
+
+Test in this order to isolate pairing, recognition, and editor input.
+
+1. **Find the device.** Scan and select the paired remote. When a battery reading is available, it confirms the battery service responded.
+2. **Test local transcription.** Turn off editor insertion and automatic sending, start the voice service, and hold the voice button while speaking a full sentence. After release, open the recordings and transcripts folder from the menu bar and look for a new WAV and its matching TXT.
+3. **Test Codex insertion.** Open Codex, select the intended composer, enable editor insertion, and record a second sentence. Check that the result arrives as editable text and waits for you to send it.
+4. **Test controls.** Enable remote controls and restart the service as prompted. Try the D-pad, center, and back buttons. Switch modes with TV and repeat, then check that volume buttons reach the intended Codex task.
+
+Restart the voice service after changing the selected device, recognition engine, or remote controls setting. **Always Ready** keeps retrying the voice connection. **Smart Sleep** pauses after repeated failures and waits for a remote button press to wake it.
+
 ## 🧠 Models
 
 | Engine | Runs on | Transcription | Required files |
@@ -149,6 +171,18 @@ Codex-specific actions require Codex. Ordinary pointer and keyboard actions do n
 `VOICE_BRIDGE_DATA_DIR` and `VOICE_BRIDGE_MODEL_DIR` override storage locations. External model paths remain in local configuration rather than source. RemoteVoice does not automatically migrate or delete MI-AO or other apps' data. Developer device identifiers, recordings, models, and Python environments are excluded from source distribution.
 
 Local recordings and transcripts can still be sensitive. Manage their retention and redact audio, identifiers, usernames, and real paths before reporting issues. See [security policy](SECURITY_EN.md).
+
+## Troubleshooting
+
+| Symptom | Where to start |
+| --- | --- |
+| The remote is paired but absent from the scan | Wake it, check macOS Bluetooth and RemoteVoice’s Bluetooth permission, and scan again. Voice features require a supported ATVV implementation |
+| The app shows Connected, but speaking produces no WAV | Check that the voice service is running with the intended device. Restart the service after changing devices. Bluetooth connection, battery reads, and the voice link have separate states |
+| A WAV appears without a matching TXT | Check the selected engine in setup and diagnostics. Verify the executable and model for Whisper or the Python environment and MLX model directory for Qwen. Record a complete sentence to rule out a clip that is too short |
+| A TXT appears but the Codex composer stays empty | Check that editor insertion is enabled, Codex is running, the intended composer is available, and the current RemoteVoice app has Accessibility permission |
+| The D-pad behaves differently from expected | Check pointer versus focus mode and whether remote controls are enabled. Use TV to switch modes and check whether a custom preset overrides the mapping |
+| Controls stopped working after rebuilding or moving the app | Open the copy you actually use and check Accessibility in setup and diagnostics. If macOS lists an older build, grant access to the current app |
+| You need to stop controls and restore the remote | Use the safe quit and restore action in the menu bar |
 
 ## 🛠️ Development and checks
 
