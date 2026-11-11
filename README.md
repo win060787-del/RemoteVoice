@@ -1,3 +1,5 @@
+[產品官網 / Product website](https://novatechai.xyz/remotevoice/) · [繁體中文](https://novatechai.xyz/zh-hant/remotevoice/)
+
 <div align="center">
 
 <img src="Resources/Brand/remotevoice-logo.png" width="160" alt="RemoteVoice silver voice remote logo">
